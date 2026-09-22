@@ -83,7 +83,9 @@ class WebSocketSignalingClient @Inject constructor(
 
     override fun sendJoin(roomId: String) {
         Log.d(TAG, "[Signaling] Sending JOIN roomId=$roomId")
-        webSocket?.send(SignalingMessageMapper.buildJoin(roomId))
+        val message = SignalingMessageMapper.buildJoin(roomId)
+        Log.d(TAG, "[Signaling] message = $message")
+        webSocket?.send(message)
     }
 
     override fun sendOffer(sdp: String) {

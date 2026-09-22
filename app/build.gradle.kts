@@ -25,7 +25,7 @@ android {
         // alias for "localhost" on your development machine (see README > Signaling Server URL).
         // On a PHYSICAL device this will NOT work - change it in-app to your machine's LAN IP,
         // e.g. ws://192.168.1.100:8080, or edit the default below.
-        buildConfigField("String", "DEFAULT_SIGNALING_SERVER_URL", "\"ws://10.0.2.2:8080\"")
+        buildConfigField("String", "DEFAULT_SIGNALING_SERVER_URL", "\"ws://10.28.86.115:8080\"")
     }
 
     buildTypes {

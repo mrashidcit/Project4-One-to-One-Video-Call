@@ -77,7 +77,17 @@ private data class ErrorMessageDto(val type: String, val code: String, val messa
 object SignalingMessageMapper {
 
     private const val TAG = "SignalingMapper"
-    private val json = Json { ignoreUnknownKeys = true; explicitNulls = false }
+    // encodeDefaults = true is REQUIRED here: every outgoing DTO (JoinMessage, OfferMessage,
+    // ...) declares its "type" field with a default value (e.g. `val type: String = "join"`)
+    // so callers don't have to repeat it. kotlinx.serialization's default Json config omits
+    // any property that still equals its declared default, which would silently drop "type"
+    // from every outgoing message (the server then rejects it as "Unknown or missing message
+    // type: undefined"). encodeDefaults = true forces it to always be written.
+    private val json = Json {
+        ignoreUnknownKeys = true
+        explicitNulls = false
+        encodeDefaults = true
+    }
 
     // ---- outgoing ----
 
