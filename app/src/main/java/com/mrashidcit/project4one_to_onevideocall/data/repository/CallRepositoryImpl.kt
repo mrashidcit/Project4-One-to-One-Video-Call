@@ -2,6 +2,7 @@ package com.mrashidcit.project4one_to_onevideocall.data.repository
 
 import android.util.Log
 import com.mrashidcit.project4one_to_onevideocall.data.signaling.SignalingClient
+import com.mrashidcit.project4one_to_onevideocall.data.webrtc.AudioRouteManager
 import com.mrashidcit.project4one_to_onevideocall.data.webrtc.LocalMediaManager
 import com.mrashidcit.project4one_to_onevideocall.data.webrtc.PeerConnectionManager
 import com.mrashidcit.project4one_to_onevideocall.data.webrtc.WebRtcClient
@@ -30,13 +31,24 @@ import javax.inject.Singleton
  * class in the app that both sends signaling messages AND drives the PeerConnection - by
  * design, neither [SignalingClient] nor [PeerConnectionManager] know about each other.
  *
- * ## Caller / callee determination (README section 19)
- * The room holds at most two peers. Whichever peer was ALREADY in the room when the second one
- * arrives is told so via `peer_joined` - that peer becomes the CALLER ([startAsCaller]) and is
- * the one who calls createOffer(). The peer that joins second never sees a `peer_joined` for
- * this pairing; it simply waits and reacts the first time an `offer` arrives, making it the
- * CALLEE ([startAsCallee]). Only one side ever calls createOffer(), so there is no glare - this
- * project deliberately does not implement perfect negotiation (section 42).
+ * ## Caller / callee determination (README section 19 - revised)
+ * The room holds at most two peers, and exactly one of them must call createOffer(). The
+ * spec's simplifying assumption - "only the peer already in the room receives peer_joined" -
+ * does NOT hold for every Project #3 implementation: some servers (including the one this was
+ * tested against) notify BOTH peers with `peer_joined` once the room fills up. Relying on
+ * "whoever receives peer_joined is the caller" then makes both sides call createOffer()
+ * simultaneously - both end up stuck in HAVE_LOCAL_OFFER, neither ever processes the other's
+ * offer (each ignores it, since it already has its own PeerConnection), no answer is ever sent,
+ * and the UI hangs on "Connecting..." forever.
+ *
+ * The fix used here is a deterministic election that both sides can compute independently,
+ * regardless of which of them actually receives `peer_joined`: once BOTH peer IDs are known
+ * (our own, from `joined`; the other's, from `peer_joined.peerId` or an incoming offer's
+ * `from`), the peer whose ID sorts lexicographically SMALLER becomes the CALLER
+ * ([startAsCaller]); the other simply waits for the incoming `offer`, making it the CALLEE
+ * ([startAsCallee]). Since peer IDs are unique and both sides compare the same two values,
+ * exactly one side calls createOffer() - no glare, no perfect-negotiation logic needed
+ * (section 42) - no matter which peer(s) the server happens to notify.
  *
  * ## Lifecycle
  * This is a Hilt @Singleton: it (and its [SignalingClient]) survive Activity/ViewModel
@@ -48,6 +60,7 @@ import javax.inject.Singleton
 class CallRepositoryImpl @Inject constructor(
     private val signalingClient: SignalingClient,
     private val webRtcClient: WebRtcClient,
+    private val audioRouteManager: AudioRouteManager,
     @ApplicationScope private val scope: CoroutineScope
 ) : CallRepository {
 
@@ -59,6 +72,19 @@ class CallRepositoryImpl @Inject constructor(
     private var localMediaManager: LocalMediaManager? = null
     private var remotePeerId: String? = null
     private var ownPeerId: String? = null
+
+    // Guards against starting a call twice (e.g. a duplicate/late peer_joined arriving while
+    // startAsCaller()/startAsCallee() is already mid-flight, before peerConnectionManager has
+    // been assigned). Reset in closePeerConnectionOnly() so a later peer can start a new call.
+    private var callInitiated = false
+
+    // ICE candidates can arrive before we've created our PeerConnection at all (not just before
+    // setRemoteDescription() - see PeerConnectionManager's own queue for that later stage): the
+    // callee only creates its PeerConnection once the offer arrives, so a candidate that beats
+    // the offer across the wire (or, on the caller side, a stray race between sendOffer() and
+    // the ICE-forwarding coroutine - see observePeerConnection()) would otherwise be silently
+    // dropped. Buffered here and flushed into the PeerConnectionManager right after it's created.
+    private val earlyIceCandidates = mutableListOf<IceCandidateModel>()
 
     private val _callState = MutableStateFlow<CallState>(CallState.Idle)
     override val callState: StateFlow<CallState> = _callState.asStateFlow()
@@ -74,6 +100,8 @@ class CallRepositoryImpl @Inject constructor(
 
     private val _isCameraEnabled = MutableStateFlow(true)
     override val isCameraEnabled: StateFlow<Boolean> = _isCameraEnabled.asStateFlow()
+
+    override val isSpeakerOn: StateFlow<Boolean> = audioRouteManager.isSpeakerOn
 
     override val eglBaseContext: EglBase.Context get() = webRtcClient.eglBaseContext
 
@@ -101,6 +129,8 @@ class CallRepositoryImpl @Inject constructor(
                 _localVideoTrack.value = media.localVideoTrack
                 _isMicEnabled.value = true
                 _isCameraEnabled.value = true
+                // Play call audio through the main loudspeaker, not the top earpiece.
+                audioRouteManager.start()
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to acquire camera/microphone", e)
                 _callState.value = CallState.Error("Could not access the camera or microphone.")
@@ -134,6 +164,10 @@ class CallRepositoryImpl @Inject constructor(
         _isCameraEnabled.value = enabled
     }
 
+    override fun toggleSpeaker() {
+        audioRouteManager.setSpeakerOn(!audioRouteManager.isSpeakerOn.value)
+    }
+
     override fun switchCamera() {
         localMediaManager?.switchCamera()
     }
@@ -150,19 +184,33 @@ class CallRepositoryImpl @Inject constructor(
             }
 
             is SignalingEvent.PeerJoined -> {
-                if (peerConnectionManager != null) {
-                    Log.w(TAG, "Ignoring peer_joined - a PeerConnection already exists")
+                if (callInitiated) {
+                    Log.w(TAG, "Ignoring peer_joined - a call is already starting/active")
+                    return
+                }
+                val own = ownPeerId
+                if (own == null) {
+                    Log.w(TAG, "peer_joined arrived before joined - ignoring")
                     return
                 }
                 remotePeerId = event.peerId
-                startAsCaller()
+                // Deterministic election - see the class doc comment above. Only the side with
+                // the lexicographically smaller peerId calls createOffer(); the other just waits
+                // for the offer that is guaranteed to arrive (SignalingEvent.OfferReceived).
+                if (own < event.peerId) {
+                    callInitiated = true
+                    startAsCaller()
+                } else {
+                    Log.d(TAG, "[Signaling] I am the callee - waiting for OFFER from ${event.peerId}")
+                }
             }
 
             is SignalingEvent.OfferReceived -> {
-                if (peerConnectionManager != null) {
-                    Log.w(TAG, "Ignoring offer - a PeerConnection already exists")
+                if (callInitiated) {
+                    Log.w(TAG, "Ignoring offer - a call is already starting/active")
                     return
                 }
+                callInitiated = true
                 remotePeerId = event.from
                 startAsCallee(event.sdp)
             }
@@ -182,7 +230,12 @@ class CallRepositoryImpl @Inject constructor(
             }
 
             is SignalingEvent.IceCandidateReceived -> {
-                val pcManager = peerConnectionManager ?: return
+                val pcManager = peerConnectionManager
+                if (pcManager == null) {
+                    Log.d(TAG, "[WebRTC] ICE candidate received before PeerConnection existed - buffering")
+                    earlyIceCandidates.add(event.candidate)
+                    return
+                }
                 val model = event.candidate
                 pcManager.addIceCandidate(IceCandidate(model.sdpMid, model.sdpMLineIndex ?: 0, model.candidate))
             }
@@ -215,7 +268,8 @@ class CallRepositoryImpl @Inject constructor(
         }
     }
 
-    // Caller: we were already in the room. createOffer() -> setLocalDescription() -> send OFFER.
+    // Caller: our peer ID sorted smaller in the election (see class doc comment above).
+    // createOffer() -> setLocalDescription() -> send OFFER.
     private suspend fun startAsCaller() {
         _callState.value = CallState.Connecting
         val pcManager = webRtcClient.newPeerConnectionManager()
@@ -223,6 +277,7 @@ class CallRepositoryImpl @Inject constructor(
         observePeerConnection(pcManager)
         pcManager.createPeerConnection()
         attachLocalTracks(pcManager)
+        flushEarlyIceCandidates(pcManager)
         try {
             val offer = pcManager.createOffer()
             pcManager.setLocalDescription(offer)
@@ -241,6 +296,7 @@ class CallRepositoryImpl @Inject constructor(
         observePeerConnection(pcManager)
         pcManager.createPeerConnection()
         attachLocalTracks(pcManager)
+        flushEarlyIceCandidates(pcManager)
         try {
             pcManager.setRemoteDescription(SessionDescription(SessionDescription.Type.OFFER, offerSdp))
             val answer = pcManager.createAnswer()
@@ -261,6 +317,16 @@ class CallRepositoryImpl @Inject constructor(
         } else {
             Log.w(TAG, "attachLocalTracks() called before local media was ready")
         }
+    }
+
+    /** Replays any ICE candidates buffered by [handleSignalingEvent] before this PeerConnection existed. */
+    private fun flushEarlyIceCandidates(pcManager: PeerConnectionManager) {
+        if (earlyIceCandidates.isEmpty()) return
+        Log.d(TAG, "[WebRTC] Replaying ${earlyIceCandidates.size} early ICE candidate(s)")
+        earlyIceCandidates.forEach { model ->
+            pcManager.addIceCandidate(IceCandidate(model.sdpMid, model.sdpMLineIndex ?: 0, model.candidate))
+        }
+        earlyIceCandidates.clear()
     }
 
     /** Forwards this call's local ICE candidates to signaling and mirrors WebRTC state into our own flows. */
@@ -302,6 +368,8 @@ class CallRepositoryImpl @Inject constructor(
     private fun closePeerConnectionOnly() {
         peerConnectionManager?.close()
         peerConnectionManager = null
+        callInitiated = false
+        earlyIceCandidates.clear()
         _remoteVideoTrack.value = null
     }
 
@@ -309,6 +377,7 @@ class CallRepositoryImpl @Inject constructor(
         closePeerConnectionOnly()
         localMediaManager?.release()
         localMediaManager = null
+        audioRouteManager.stop()
         _localVideoTrack.value = null
         remotePeerId = null
         ownPeerId = null

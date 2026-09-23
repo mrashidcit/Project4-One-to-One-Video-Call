@@ -35,6 +35,9 @@ interface CallRepository {
     /** Whether the local camera track is currently enabled. */
     val isCameraEnabled: StateFlow<Boolean>
 
+    /** true = audio plays from the main loudspeaker, false = from the top earpiece. */
+    val isSpeakerOn: StateFlow<Boolean>
+
     /** Shared EGL context every SurfaceViewRenderer must be initialized with. */
     val eglBaseContext: EglBase.Context
 
@@ -49,6 +52,9 @@ interface CallRepository {
 
     /** Enable/disable the local camera (stops/starts the capturer too - see LocalMediaManager). */
     fun toggleCamera()
+
+    /** Switch call audio between the main loudspeaker and the top earpiece. */
+    fun toggleSpeaker()
 
     /** Switch between front and back camera without recreating the PeerConnection. */
     fun switchCamera()

@@ -8,6 +8,7 @@ sealed interface CallUiEvent {
     data object ToggleMicrophone : CallUiEvent
     data object ToggleCamera : CallUiEvent
     data object SwitchCamera : CallUiEvent
+    data object ToggleSpeaker : CallUiEvent
     data object EndCallClicked : CallUiEvent
     data object ErrorDismissed : CallUiEvent
     /** Camera/microphone permission was denied - shown as a friendly error instead of crashing. */

@@ -17,6 +17,8 @@ data class CallUiState(
     val errorMessage: String? = null,
     val isMicEnabled: Boolean = true,
     val isCameraEnabled: Boolean = true,
+    /** true = main loudspeaker, false = top earpiece. */
+    val isSpeakerOn: Boolean = true,
     val localVideoTrack: VideoTrack? = null,
     val remoteVideoTrack: VideoTrack? = null,
     val eglBaseContext: EglBase.Context? = null

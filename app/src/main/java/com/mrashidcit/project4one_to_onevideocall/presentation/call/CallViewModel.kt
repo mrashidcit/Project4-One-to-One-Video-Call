@@ -53,6 +53,10 @@ class CallViewModel @Inject constructor(
                 )
             }
         }.onEach { }.launchIn(viewModelScope)
+
+        callRepository.isSpeakerOn
+            .onEach { speakerOn -> _uiState.update { it.copy(isSpeakerOn = speakerOn) } }
+            .launchIn(viewModelScope)
     }
 
     fun onEvent(event: CallUiEvent) {
@@ -79,6 +83,7 @@ class CallViewModel @Inject constructor(
             CallUiEvent.ToggleMicrophone -> callRepository.toggleMicrophone()
             CallUiEvent.ToggleCamera -> callRepository.toggleCamera()
             CallUiEvent.SwitchCamera -> callRepository.switchCamera()
+            CallUiEvent.ToggleSpeaker -> callRepository.toggleSpeaker()
             CallUiEvent.EndCallClicked -> callRepository.endCall()
             CallUiEvent.ErrorDismissed -> _uiState.update { it.copy(errorMessage = null) }
 

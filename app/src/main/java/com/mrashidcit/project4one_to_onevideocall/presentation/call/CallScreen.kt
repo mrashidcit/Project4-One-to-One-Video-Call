@@ -242,6 +242,12 @@ private fun InCallScreen(uiState: CallUiState, onEvent: (CallUiEvent) -> Unit) {
                     isActive = true,
                     onClick = { onEvent(CallUiEvent.SwitchCamera) }
                 )
+                ControlButton(
+                    emoji = if (uiState.isSpeakerOn) "🔊" else "🔈",
+                    contentDescription = if (uiState.isSpeakerOn) "Switch to earpiece" else "Switch to loudspeaker",
+                    isActive = true,
+                    onClick = { onEvent(CallUiEvent.ToggleSpeaker) }
+                )
             }
             Spacer(modifier = Modifier.height(20.dp))
             ControlButton(

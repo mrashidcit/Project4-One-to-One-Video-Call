@@ -210,24 +210,54 @@ No stack traces or raw server text ever reach the UI.
 
 ## 6. Caller / Callee Determination
 
-The room holds at most two peers. This client uses one deterministic rule (spec section 19):
+The room holds at most two peers. The spec's original rule (section 19) was:
 
-> **The peer that was already in the room becomes the caller. The peer that joins second
-> becomes the callee.**
+> The peer that was already in the room becomes the caller. The peer that joins second
+> becomes the callee.
 
-Concretely, in `CallRepositoryImpl`:
+That rule assumes only the peer *already* in the room ever receives `peer_joined`. In
+practice, this project's Project #3 signaling server broadcasts `peer_joined` to **both**
+peers once the room has two members (it simply notifies "the room now has a new member" to
+everyone else in it, rather than only to the peer who was there first). If the client trusted
+"I received `peer_joined` => I am the caller" literally, both devices would decide they were
+the caller at the same time: both would create a PeerConnection, both would `createOffer()`
+and send it, and both would then receive the other's `offer` and ignore it (because they
+already had a PeerConnection of their own) - so neither side would ever call
+`setRemoteDescription()` on a real offer, neither would send an `answer`, and every ICE
+candidate would queue forever. That's exactly the **stuck-on-"Connecting..." bug** this
+project hit during two-device testing: both devices' logs showed `PEER_JOINED` followed by
+`Sending OFFER`, then `Ignoring offer - a PeerConnection already exists`.
 
-* Receiving **`peer_joined`** means *someone else just joined the room I was already in* ->
-  I am the **caller** -> `startAsCaller()`: create the PeerConnection, `createOffer()`,
-  `setLocalDescription()`, send `offer`.
-* Receiving an **`offer`** (with no PeerConnection of my own yet) means *I never called
-  createOffer() myself, someone is calling me* -> I am the **callee** ->
-  `startAsCallee(offerSdp)`: create the PeerConnection, `setRemoteDescription(offer)`,
-  `createAnswer()`, `setLocalDescription()`, send `answer`.
+The fix: stop relying on *which message a device happens to receive* (a delivery-order
+assumption the server doesn't actually guarantee) and instead make the caller/callee decision
+**deterministic from data both sides already have** - their peer IDs, assigned by the server
+in the `joined` message. Concretely, in `CallRepositoryImpl.handleSignalingEvent()`:
 
-Both branches also guard on `peerConnectionManager != null` and ignore a second
-`peer_joined`/`offer` for the same pairing, so **only one side ever calls `createOffer()`** -
-there is no glare, and no perfect-negotiation logic is needed (spec section 42).
+* On **`peer_joined`**, compare peer IDs lexicographically (`own < event.peerId`):
+  * If **my own peer ID sorts smaller**, I am the **caller** -> `startAsCaller()`: create the
+    PeerConnection, `createOffer()`, `setLocalDescription()`, send `offer`.
+  * Otherwise I am the **callee** and do nothing yet - I just wait for the `offer` that is
+    guaranteed to arrive, since the other side just decided (by the same comparison, run
+    independently on its own copy of both IDs) that it is the caller.
+* On **`offer`**, I am unambiguously the **callee** -> `startAsCallee(offerSdp)`: create the
+  PeerConnection, `setRemoteDescription(offer)`, `createAnswer()`, `setLocalDescription()`,
+  send `answer`.
+
+Because both devices compare the *same pair* of IDs with the *same* operator, they always
+reach opposite conclusions - there is no case where both or neither decide to call
+`createOffer()`, regardless of which device happens to receive `peer_joined`, `offer`, or
+both. A `callInitiated` flag (set the instant either branch commits to caller or callee, reset
+in `closePeerConnectionOnly()`) guards against a duplicate or late `peer_joined`/`offer`
+re-triggering this logic mid-flight, so **only one side ever calls `createOffer()`** - there
+is no glare, and no perfect-negotiation logic is needed (spec section 42).
+
+One more edge case this uncovered: because the callee no longer creates its PeerConnection
+the instant it sees `peer_joined` (it now waits for the `offer`), a trickled ICE candidate can
+arrive from the signaling server *before* the callee has a PeerConnection to hand it to at
+all - not just before `setRemoteDescription()` has run on it (that later stage was already
+handled by `PeerConnectionManager`'s own internal queue). `CallRepositoryImpl` now buffers
+these in `earlyIceCandidates` and replays them via `flushEarlyIceCandidates()` immediately
+after the PeerConnection is created in both `startAsCaller()` and `startAsCallee()`.
 
 ## 7. WebRTC Dependency
 
@@ -254,7 +284,7 @@ the comments there.
 ## 8. Complete WebRTC + Signaling Flow
 
 ```
-DEVICE A (already in room)                DEVICE B (joins second)
+DEVICE A (smaller peer ID -> caller)       DEVICE B (larger peer ID -> callee)
 
 Connect WebSocket                          Connect WebSocket
       |                                           |
@@ -262,7 +292,10 @@ Send JOIN                                   Send JOIN
       |                                           |
 Receive JOINED (store peerId)               Receive JOINED (store peerId)
       |                                           |
-Wait for PEER_JOINED  <--------- server notifies A that B joined
+Receive PEER_JOINED                         Receive PEER_JOINED
+      |                                           |
+Compare peer IDs: mine is smaller           Compare peer IDs: mine is larger
+      -> I am the caller                          -> I am the callee, just wait for OFFER
       |
 Create PeerConnection                       Create PeerConnection (on first OFFER, below)
       |
@@ -329,11 +362,14 @@ Android A             Server             Android B
    |<----------- AUDIO / VIDEO (peer-to-peer) ---------->|
 ```
 
-*(This project's rule for who receives `peer_joined` is: only the peer already in the room
-does. See "Caller / Callee Determination" above - the spec's own diagram simplifies this a
-little, our implementation is defensive either way: a second `peer_joined`/`offer` for a
-pairing that already has a PeerConnection is ignored, so this holds regardless of exactly how
-your Project #3 server implements the notification.)*
+*(The spec's own diagram simplifies this a little: it assumes only device A ever receives
+`PEER_JOINED`. This project's actual Project #3 server broadcasts `PEER_JOINED` to both
+devices, so both branches of the flow above run on both devices - the peer-ID comparison in
+"Caller / Callee Determination" is what decides, independently and consistently on each side,
+which one actually calls `createOffer()`. A `callInitiated` guard also makes this robust
+either way: a second `peer_joined`/`offer` for a pairing that has already started a call is
+ignored, so this holds regardless of exactly how your Project #3 server implements the
+notification.)*
 
 ### Step by step, mapped to code
 
@@ -492,9 +528,10 @@ security config scoped to your dev host only). Do not ship the cleartext-enabled
 4. On both devices, set the same **Signaling server URL** and enter the **same Room ID**
    (e.g. `room-123`).
 5. Grant camera + microphone permissions when prompted.
-6. Tap **Join Room** on device A first, then device B. Device A becomes the caller, device B
-   the callee (see "Caller / Callee Determination"); within a couple of seconds you should see
-   each other's video.
+6. Tap **Join Room** on device A first, then device B (or in either order - it no longer
+   matters which one joins first). Whichever device has the lexicographically smaller peer ID
+   becomes the caller, the other the callee (see "Caller / Callee Determination"); within a
+   couple of seconds you should see each other's video.
 
 ## 14. Testing With Two Devices
 
